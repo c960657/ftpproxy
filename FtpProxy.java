@@ -1,5 +1,5 @@
 /*
-Java FTP Proxy Server 1.2.2
+Java FTP Proxy Server 1.2.3
 Copyright (C) 1998-2002 Christian Schmidt
 
 This program is free software; you can redistribute it and/or
@@ -15,6 +15,8 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
 Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+
+Contributor(s): Rasjid Wilcox - support for masquerading of local IP
 
 
 Find the latest version at http://christianschmidt.dk/ftpproxy
@@ -38,7 +40,7 @@ public class FtpProxy extends Thread {
     Socket skDataClient, skDataServer;
 
     //IP of interface facing client and server respectively
-    final String sLocalClientIP;
+    String sLocalClientIP;
     String sLocalServerIP;
 
     private final Configuration config;
@@ -65,9 +67,10 @@ public class FtpProxy extends Thread {
 
     public FtpProxy(Configuration config, Socket skControlClient) {
         this.config = config;
-        this.skControlClient = skControlClient;
-        
-        sLocalClientIP = skControlClient.getLocalAddress().getHostAddress().replace('.' ,',');
+        this.skControlClient = skControlClient;  
+
+	//sLocalClientIP is initialized in main(), to handle
+	//masquerade_host where the IP address for the host is dynamic.
     }       
     
     public static void main(String args[]) {
@@ -142,6 +145,20 @@ public class FtpProxy extends Thread {
                 return;
             }
 
+	    try {
+		if (config.masqueradeHostname == null) {
+		    sLocalClientIP = skControlClient.getLocalAddress().getHostAddress().replace('.', ',');
+		} else {
+		    sLocalClientIP = InetAddress.getByName(config.masqueradeHostname.trim()).getHostAddress().replace('.', ',');
+		}
+	    } catch (UnknownHostException e) {
+		String toClient = config.msgMasqHostDNSError;
+		psClient.print(toClient + CRLF);
+		if (config.debug) pwDebug.println(proxy2client + toClient);
+		skControlClient.close();
+		return;
+	    }
+
             String username = null;
             String hostname = null;
             int serverport = 21;
@@ -190,7 +207,7 @@ public class FtpProxy extends Thread {
                     hostname = userString.substring(a + 1, c);
                     serverport = Integer.parseInt(userString.substring(c + 1));
                 }
-            } //if config.onlyAuto
+            }
                 
             //don't know which host to connect to
             if (hostname == null) {
@@ -300,6 +317,7 @@ public class FtpProxy extends Thread {
 
             if (ssDataClient != null) {
                 int port = ssDataClient.getLocalPort();
+
                 String toClient = "227 Entering Passive Mode (" + sLocalClientIP + "," + 
                         (int) (port / 256) + "," + (port % 256) + ")";
                 psClient.print(toClient + CRLF);
@@ -395,9 +413,9 @@ public class FtpProxy extends Thread {
     }
 
     private void setupServerConnection(Object s) throws IOException {
-		if (skDataServer != null) {
-		    try {skDataServer.close();} catch (IOException ioe) {}
-		}
+	if (skDataServer != null) {
+	    try {skDataServer.close();} catch (IOException ioe) {}
+	}
 
         if (serverPassive) {
             String toServer = "PASV";
@@ -413,9 +431,9 @@ public class FtpProxy extends Thread {
             
             (dcData = new DataConnect(s, skDataServer)).start();
         } else {
-    		if (ssDataServer != null && !config.serverOneBindPort) {
-    		    try {ssDataServer.close();} catch (IOException ioe) {}
-    		}
+	    if (ssDataServer != null && !config.serverOneBindPort) {
+		try {ssDataServer.close();} catch (IOException ioe) {}
+	    }
     
             if (ssDataServer == null || !config.serverOneBindPort) {
                 ssDataServer = getServerSocket(config.serverBindPorts, skControlServer.getLocalAddress());
@@ -572,6 +590,7 @@ class Configuration {
     boolean onlyAuto;
     String autoHostname;
     int autoPort;
+    String masqueradeHostname;
     boolean isUrlSyntaxEnabled;
     int[] serverBindPorts;
     int[] clientBindPorts;
@@ -590,6 +609,7 @@ class Configuration {
     String msgDestinationAccessDenied;
     String msgIncorrectSyntax;
     String msgInternalError;
+    String msgMasqHostDNSError;
 
     public Configuration(Properties properties) throws UnknownHostException {
 
@@ -603,7 +623,14 @@ class Configuration {
                             serverBindPorts[0] == serverBindPorts[1];
         clientOneBindPort = clientBindPorts != null && clientBindPorts.length == 2 && 
                             clientBindPorts[0] == clientBindPorts[1];
-        
+
+	masqueradeHostname = properties.getProperty("masquerade_host");
+        if (masqueradeHostname != null) {
+            //This is just to throw an UnknownHostException
+            //if the config is incorrectly set up.
+	    InetAddress.getByName(masqueradeHostname.trim());  
+	}
+
         useActive  = readSubnets(properties.getProperty("use_active"));
         usePassive = readSubnets(properties.getProperty("use_passive"));
         allowFrom  = readSubnets(properties.getProperty("allow_from"));
@@ -637,6 +664,9 @@ class Configuration {
         msgInternalError = "421 " + 
             properties.getProperty("msg_internal_error", 
                                    "Internal error, closing connection.");
+	msgMasqHostDNSError = "421 " +
+	    properties.getProperty("msg_masqerade_hostname_dns_error",
+				   "Unable to resolve address for " + masqueradeHostname + " - closing connection.");
     }
 
     public static List readSubnets(String s) {
