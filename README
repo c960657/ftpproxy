@@ -1,0 +1,8 @@
+To run the program, type 
+    
+    java FtpProxy
+    
+(or "java -cp . FtpProxy" if for some reason the current directory is 
+not in your classpath).
+
+For further documentation refer to http://christianschmidt.dk/ftpproxy

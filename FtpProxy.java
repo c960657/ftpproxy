@@ -1,6 +1,6 @@
 /*
-Java FTP Proxy Server 1.1.1
-Copyright (C) 1998-2000 Christian Schmidt
+Java FTP Proxy Server 1.2.2
+Copyright (C) 1998-2002 Christian Schmidt
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -15,509 +15,675 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
 Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
-*/
 
+
+Find the latest version at http://christianschmidt.dk/ftpproxy
+*/
 
 import java.net.*;
 import java.io.*;
 import java.util.*;
 
 public class FtpProxy extends Thread {
-    private static String sDefaultConfigFile = "ftpproxy.conf";
+    private final static String configFile = "ftpproxy.conf";
 
-    private static int DEFAULT_BACKLOG = 50;
-    private static int SOTIMEOUT = 2000;
-    private static int DATASOTIMEOUT = 1000;
-    private static int DATABUFFERSIZE = 512;
+    final static int DEFAULT_BACKLOG = 50;
+    final static int DATABUFFERSIZE = 512;
 
-    private Socket skControlClient, skControlServer;
-    private BufferedReader rClient, rServer;
-    private PrintStream osClient, osServer;
-    private ServerSocket ssDataClient, ssDataServer;
-    private Socket skDataClient;
-    private ControlConnect ccControl;
-    private DataConnect dcData;
+    Socket skControlClient, skControlServer;
+    BufferedReader brClient, brServer;
+    PrintStream psClient, osServer;
 
-    private static Properties pConfig = new Properties();
-
-    //lists of subnets allowed and denied access
-    private static List allowFrom;
-    private static List denyFrom;
-    private static List allowTo;
-    private static List denyTo;
+    ServerSocket ssDataClient, ssDataServer;
+    Socket skDataClient, skDataServer;
 
     //IP of interface facing client and server respectively
-    private String sLocalClientIP, sLocalServerIP;
+    final String sLocalClientIP;
+    String sLocalServerIP;
 
+    private final Configuration config;
+
+    DataConnect dcData;
+    boolean serverPassive = false;
+
+    final static Map lastPorts = new HashMap();
+    
     //constants for debug output
-    private static boolean debug = false;
-    private static PrintStream pwDebug = System.out;
-    private static String sServer = "Server> ";
-    private static String sClient = "Client> ";
-    private static String sProxy  = "Proxy > ";
-    private static String sSpace  = "        ";
+    final static PrintStream pwDebug = System.out;
+    final static String server2proxy = "S->P: ";
+    final static String proxy2server = "S<-P: ";
+    final static String proxy2client = "P->C: ";
+    final static String client2proxy = "P<-C: ";
+    final static String server2client = "S->C: ";
+    final static String client2server = "S<-C: ";
+
 
     //use CRLF instead of println() to ensure that CRLF is used
     //on all platforms
     public static String CRLF = "\r\n";
 
-    public FtpProxy (Socket skControlClient) {
-	this.skControlClient = skControlClient;
+
+    public FtpProxy(Configuration config, Socket skControlClient) {
+        this.config = config;
+        this.skControlClient = skControlClient;
+        
+        sLocalClientIP = skControlClient.getLocalAddress().getHostAddress().replace('.' ,',');
     }       
     
+    public static void main(String args[]) {
+        //read configuration
+        Properties properties = new Properties();
+        try {
+            properties.load(new FileInputStream(configFile));
+        } catch (IOException e) {}
+
+        Configuration config;
+        try {      
+            config = new Configuration(properties);
+        } catch (Exception e) {
+            System.err.println("Invalid configuration: " + e.getMessage());
+            System.exit(0);
+            return; //to make it compile
+        }
+        
+
+       
+        int port;
+        if (args.length == 1) {
+            port = Integer.parseInt(args[0]);
+
+        } else if (args.length > 1) {
+            System.err.println("Usage: java FtpProxy [port]");
+            System.exit(0);
+            return; //to make it compile
+
+        } else {
+            port = config.bindPort;
+        }
+
+        try {
+            ServerSocket ssControlClient;
+            
+            if (config.bindAddress == null) {
+                ssControlClient = new ServerSocket(port);
+            } else {
+                ssControlClient = new ServerSocket(port, DEFAULT_BACKLOG, config.bindAddress);
+            }
+             
+            if (config.debug) pwDebug.println("Listening on port " + port);
+
+            while (true) {
+                Socket skControlClient = ssControlClient.accept();
+                if (config.debug) pwDebug.println("New connection");
+                new FtpProxy(config, skControlClient).start();
+            }
+        } catch (IOException e) {
+            if (config.debug) {
+                e.printStackTrace(pwDebug);
+            } else {
+                System.err.println(e.toString());
+            }
+        }
+    }
+
     public void run() {
-	String sFromClient, sFromServer;
+        try {
+            brClient = new BufferedReader(new InputStreamReader(skControlClient.getInputStream()));
+            psClient = new PrintStream(skControlClient.getOutputStream());
 
-	ccControl = new ControlConnect();
+            if ((config.allowFrom != null && 
+                 !isInSubnetList(config.allowFrom, skControlClient.getInetAddress())) ||
+                isInSubnetList(config.denyFrom, skControlClient.getInetAddress())) {
 
-	try {
-	    rClient = new BufferedReader(new InputStreamReader(skControlClient.getInputStream()));
-	    osClient = new PrintStream(skControlClient.getOutputStream());
-	    sLocalClientIP = skControlClient.getLocalAddress().getHostAddress().replace('.' ,',');
-
-	    if ((allowFrom != null && 
-	    	 !isInSubnetList(allowFrom, skControlClient.getInetAddress())) ||
-	        isInSubnetList(denyFrom, skControlClient.getInetAddress())) {
-
-                sFromServer = "531 " + 
-                    pConfig.getProperty("msg_origin_access_denied", 
-                    			"Access denied - closing connection.");
-	    	
-                osClient.print(sFromServer + CRLF);
-                if (debug) pwDebug.println(sProxy + sFromServer);
-                skControlClient.close();
-                return;
-	    }
-
-   	    boolean onlyAuto = pConfig.getProperty("only_auto", "0").equals("1");
-
-	    String sUser = null;
-            String sServerHost = null;
-            int iServerPort = 21;
-
-            String sAutoHost = pConfig.getProperty("auto_host");
-	    int iAutoPort = Integer.parseInt(pConfig.getProperty("auto_port", "21"));
-	    
-	    if (onlyAuto && sAutoHost != null) {
-                sUser = null; //value will not be used
-                sServerHost = sAutoHost;
-                iServerPort = iAutoPort;
-	    } else {
-	    	if (onlyAuto) { //and sAutoHost == null
-	    	    throw new RuntimeException("only_auto is enabled, but no auto_host is set");
-	    	}
-	    	
-                sFromServer = "220 " + pConfig.getProperty("msg_connect", 
-                	"Java FTP Proxy Server (usage: USERID=user@site) ready.");
-                osClient.print(sFromServer + CRLF);
-                osClient.flush();
-                if (debug) pwDebug.println(sProxy + sFromServer);
-                
-                //the username is read from the client
-                sFromClient = rClient.readLine(); 
-                if (debug) pwDebug.println(sClient + sFromClient); 
-                
-                int a = sFromClient.indexOf('@');
-                int c = sFromClient.lastIndexOf(':');
-    
-                boolean enableUrlSyntax = 
-                    pConfig.getProperty("enable_url_syntax", "1").equals("1");
-    
-                if (a == -1 && enableUrlSyntax) {
-                    int a1 = sFromClient.indexOf('*');
-                    if (a1 != -1) {
-                    	a = a1;
-	 		c = sFromClient.lastIndexOf('*');
-	                if (c == a) c = -1;
-	            }
-                }
-                if (a == -1) {
-                    sUser = sFromClient;
-		    sServerHost = sAutoHost;
-		    iServerPort = iAutoPort;
-                } else if (c == -1) {
-                    sUser = sFromClient.substring(0, a);
-                    sServerHost = sFromClient.substring(a + 1);
-                } else {
-                    sUser = sFromClient.substring(0, a);
-                    sServerHost = sFromClient.substring(a + 1, c);
-                    iServerPort = Integer.parseInt(sFromClient.substring(c + 1));
-                }
-	    } //if onlyAuto
-                
-	    //don't know which host to connect to
-            if (sServerHost == null) {
-            	sFromServer = "531 " + 
-            	    pConfig.getProperty("msg_incorrect_syntax", 
-           				"Incorrect usage - closing connection.");
-                if (debug) pwDebug.println(sProxy + sFromServer);
-                osClient.print(sFromServer + CRLF);
+                String toClient = config.msgOriginAccessDenied;
+                psClient.print(toClient + CRLF);
+                if (config.debug) pwDebug.println(proxy2client + toClient);
                 skControlClient.close();
                 return;
             }
 
-	    InetAddress iaServerHost = InetAddress.getByName(sServerHost);
+            String username = null;
+            String hostname = null;
+            int serverport = 21;
 
-	    if ((allowTo != null && 
-	    	 !isInSubnetList(allowTo, iaServerHost)) ||
-	        isInSubnetList(denyTo, iaServerHost)) {
+            if (config.onlyAuto && config.autoHostname != null) {
+                username = null; //value will not be used
+                hostname = config.autoHostname;
+                serverport = config.autoPort;
 
-                sFromServer = "531 " + 
-                    pConfig.getProperty("msg_destination_access_denied", 
-                    			"Access denied - closing connection."); 
-	    	
-                osClient.print(sFromServer + CRLF);
+            } else {
+                if (config.onlyAuto) { //and autoHostname == null
+                    throw new RuntimeException("only_auto is enabled, but no auto_host is set");
+                }
+                
+                String toClient = config.msgConnect;
+                psClient.print(toClient + CRLF);
+                psClient.flush();
+                if (config.debug) pwDebug.println(proxy2client + toClient);
+                
+                //the username is read from the client
+                String fromClient = brClient.readLine(); 
+                if (config.debug) pwDebug.println(client2proxy + fromClient); 
+                
+                String userString = fromClient.substring(5);
+                
+                int a = userString.indexOf('@');
+                int c = userString.lastIndexOf(':');
+    
+                if (a == -1 && config.isUrlSyntaxEnabled) {
+                    int a1 = userString.indexOf('*');
+                    if (a1 != -1) {
+                        a = a1;
+                        c = userString.lastIndexOf('*');
+                        if (c == a) c = -1;
+                    }
+                }
+                if (a == -1) {
+                    username = userString;
+                    hostname = config.autoHostname;
+                    serverport = config.autoPort;
+                } else if (c == -1) {
+                    username = userString.substring(0, a);
+                    hostname = userString.substring(a + 1);
+                } else {
+                    username = userString.substring(0, a);
+                    hostname = userString.substring(a + 1, c);
+                    serverport = Integer.parseInt(userString.substring(c + 1));
+                }
+            } //if config.onlyAuto
+                
+            //don't know which host to connect to
+            if (hostname == null) {
+                String toClient = config.msgIncorrectSyntax;
+                if (config.debug) pwDebug.println(proxy2client + toClient);
+                psClient.print(toClient + CRLF);
                 skControlClient.close();
                 return;
-	    }
+            }
 
-	    if (debug) pwDebug.println("Connecting to " + sServerHost + 
-				       " on port " + iServerPort);
-	    skControlServer = new Socket(iaServerHost, iServerPort);
-	
-	    rServer = new BufferedReader(new InputStreamReader(skControlServer.getInputStream()));
-	    osServer = new PrintStream(skControlServer.getOutputStream(), true);
-	    sLocalServerIP = skControlServer.getLocalAddress().getHostAddress().replace('.' ,',');
+            InetAddress serverAddress = InetAddress.getByName(hostname);
 
-	    if (onlyAuto) {
-	    	ccControl.setIgnoreServer(false);
-	    } else {
-                osServer.print(sUser + CRLF); //USER user
-                osServer.flush();
-                if (debug) pwDebug.println(sProxy + sUser);
-	    }
-	    
-	    skControlClient.setSoTimeout(SOTIMEOUT);
-	    skControlServer.setSoTimeout(SOTIMEOUT);
-	    ccControl.start();
-	} catch (ConnectException e) {
-	    sFromServer = "421 " + 
-            	    pConfig.getProperty("msg_connection_refused", 
-           				"Connection refused, closing connection.");
-	    osClient.print(sFromServer + CRLF);
-	    osClient.flush();
-	    if (debug) pwDebug.println(sProxy + sFromServer + e.toString());
-	    ccControl.close();
-	} catch (Exception e) {
-	    sFromServer = "421 " + 
-            	    pConfig.getProperty("msg_internal_error", 
-           				"Internal error, closing connection.");
-	    if (debug) pwDebug.println(sProxy + sFromServer + e.toString());
-	    osClient.print(sFromServer + CRLF);
-	    osClient.flush();
-	    ccControl.close();
-	}
-    }
+            if ((config.allowTo != null && 
+                 !isInSubnetList(config.allowTo, serverAddress)) ||
+                isInSubnetList(config.denyTo, serverAddress)) {
 
-    public static void main (String args[]) {
-	try {
-            pConfig.load(new FileInputStream(sDefaultConfigFile));
-        } catch (IOException e) {
-            //use defaults
-        }   
-        allowFrom = readSubnets("allow_from");
-        denyFrom = readSubnets("deny_from");
-        allowTo = readSubnets("allow_to");
-        denyTo = readSubnets("deny_to");
-	int port;
+                String toClient = config.msgDestinationAccessDenied;
+                
+                psClient.print(toClient + CRLF);
+                skControlClient.close();
+                return;
+            }
 
-	if (args.length == 1) {
-	    port = Integer.parseInt(args[0]);
-	} else if (args.length > 1) {
-	    System.out.println("Usage: java FtpProxy [port]");
-	    System.exit(0);
-	    return; //to make it compile
-	} else {
-	    port = Integer.parseInt(pConfig.getProperty("port", "8089"));
-	}
+            serverPassive = config.useActive != null && !isInSubnetList(config.useActive, serverAddress) ||
+                            isInSubnetList(config.usePassive, serverAddress);
 
-        try {
-	    ServerSocket ssControlClient;
-	    
-	    String sBindAddress = pConfig.getProperty("bind_address");
-	    if (sBindAddress == null) {
-	    	ssControlClient = new ServerSocket(port);
-	    } else {
-	    	InetAddress bindAddr = InetAddress.getByName(sBindAddress);
-		ssControlClient = new ServerSocket(port, DEFAULT_BACKLOG, bindAddr);
-	    }
-	     
-	    if (debug) pwDebug.println("Listening on port " + port);
-
-	    while (true) {
-		Socket skControlClient = ssControlClient.accept();
-		if (debug) pwDebug.println("New connection");
-		new FtpProxy(skControlClient).start();
-	    }
-	} catch (IOException e) {
-	    System.err.println(e.toString());
-	}
-    }
-
-    private static List readSubnets(String fieldName) {
-    	String field = pConfig.getProperty(fieldName);
-    	if (field == null) return null;
-    	
-    	List v = new LinkedList();
-        StringTokenizer st = new StringTokenizer(field, ",");
-	while (st.hasMoreTokens()) {
-	    v.add(new Subnet(st.nextToken()));
-        }
+            if (config.debug) pwDebug.println("Connecting to " + hostname + " on port " + serverport);
+                                       
+            try {
+                skControlServer = new Socket(serverAddress, serverport);
+            } catch (ConnectException e) {
+                String toClient = config.msgConnectionRefused;
+                psClient.print(toClient + CRLF);
+                psClient.flush();
+                if (config.debug) pwDebug.println(proxy2client + toClient);
+                return;
+            }
         
-        return v;
-    }
-    
-    private static boolean isInSubnetList(List list, InetAddress ia) {
-    	if (list == null) return false;
-    	
-    	for (Iterator iterator = list.iterator(); iterator.hasNext(); ) {
-    	    Subnet subnet = (Subnet) iterator.next();
-    	    
-    	    if (subnet.isInSubnet(ia)) return true;
-    	}
-    	return false;
-    }
-    
-    public class ControlConnect extends Thread {
-	private boolean bClosed = false;
-	
-	//don't send next reply from server to client
-	private boolean bIgnoreServer = true; 
+            brServer = new BufferedReader(new InputStreamReader(skControlServer.getInputStream()));
+            osServer = new PrintStream(skControlServer.getOutputStream(), true);
+            sLocalServerIP = skControlServer.getLocalAddress().getHostAddress().replace('.' ,',');
 
-	private String readLine(BufferedReader br) throws IOException {
-	    while (!bClosed)
-		try { 
-		    return br.readLine();
-		} catch (InterruptedIOException iioe) {}
-	    throw new IOException();
-	}
-
-	public void setIgnoreServer(boolean bIgnoreServer) {
-	    this.bIgnoreServer = bIgnoreServer;
-	}
-
-	private void fromServer() throws IOException {
-	    String sFromServer;
-
-            String multiLine = "";
-            do {
-                sFromServer = readLine(rServer);
-                synchronized (this) {
-                    if (sFromServer == null) {
-                        return;
-                    }
-                    if (multiLine.length() == 0) {
-                        if (sFromServer.charAt(3) == '-') {
-                            multiLine = sFromServer.substring(0, 3) + ' ';
-                        }
-                    }
-                    if (!bIgnoreServer) {
-                        osClient.print(sFromServer + CRLF);
-                        osClient.flush();
-                    }
-                    if (debug) pwDebug.println(sServer + sFromServer);
+            if (!config.onlyAuto) {
+                String fromServer = readResponseFromServer(false);
+                
+                if (fromServer.startsWith("421")) {
+                    String toClient = fromServer;
+                    psClient.print(toClient + CRLF);
+                    psClient.flush();
+                    return;
                 }
-            } while (!sFromServer.startsWith(multiLine));
-            bIgnoreServer = false;
-	}
+                String toServer = "USER " + username;
+                osServer.print(toServer + CRLF); //USER user
+                osServer.flush();
+                if (config.debug) pwDebug.println(proxy2server + toServer);
+            }
+            
+            readResponseFromServer(true);
 
-	private synchronized void fromClient(String sFC) throws IOException {
-	    String sFromServer, sFromClient = sFC;
+            for (;;) {
+                String s = brClient.readLine();
+                if (s == null) {
+                    break;
+                }
+                readCommandFromClient(s);
+            }
 
-	    if (sFromClient == null) {
-		close();
-		return;
-	    } else if (sFromClient.toUpperCase().startsWith("PASS")) {
-		osServer.print(sFromClient + CRLF);
-		osServer.flush();
-		if (debug) pwDebug.println(sClient + "PASS *****");
-	    } else if (sFromClient.toUpperCase().startsWith("PASV")) {
-		if (debug) pwDebug.println(sClient + sFromClient);
-    
-		try { if (ssDataClient != null) ssDataClient.close(); } catch (IOException ioe) {}
-		try { if (skDataClient != null) skDataClient.close(); } catch (IOException ioe) {}
-		try { if (ssDataServer != null) ssDataServer.close(); } catch (IOException ioe) {}
+        } catch (Exception e) {
+            String toClient = config.msgInternalError;
+            if (config.debug) {
+                pwDebug.println(proxy2client + toClient + e.toString());
+                e.printStackTrace(pwDebug);
+            }
+            psClient.print(toClient + CRLF);
+            psClient.flush();
 
-		if (dcData != null) dcData.close();
-		skDataClient = null;
-
-		ssDataClient = new ServerSocket(0, 1, skControlClient.getLocalAddress());
-
-		int iPort = ssDataClient.getLocalPort();
-		sFromServer = "227 Entering Passive Mode (" + sLocalClientIP + "," + (int)(iPort/256) + "," + (iPort % 256) + ")";
-		osClient.print(sFromServer + CRLF);
-		osClient.flush();
-		if (debug) pwDebug.println(sProxy + sFromServer);
-		    
-		ssDataServer = new ServerSocket(0, 1, skControlServer.getLocalAddress());
-
-		iPort = ssDataServer.getLocalPort();
-		sFromClient = "PORT " + sLocalServerIP + ',' + (int)(iPort/256) + ',' + (iPort % 256);
-
-		osServer.print(sFromClient + CRLF);
-		osServer.flush();
-		if (debug) pwDebug.println(sProxy + sFromClient);
-
-		bIgnoreServer = true;
-
-		(dcData = new DataConnect(ssDataClient, ssDataServer)).start();
-    
-	    } else if (sFromClient.toUpperCase().startsWith("PORT")) {
-		int iClientPort, i;
-		try {
-		    i = sFromClient.lastIndexOf(',');
-		    iClientPort = Integer.parseInt(sFromClient.substring(i+1));
-		    iClientPort += 256 * Integer.parseInt(sFromClient.substring(sFromClient.lastIndexOf(',', i-1)+1, i));
-		} catch (Exception e) {throw new IOException();}
-
-		if (ssDataClient != null) try {ssDataClient.close();} catch (IOException ioe) {}
-		if (skDataClient != null) try {skDataClient.close();} catch (IOException ioe) {}
-		if (ssDataServer != null) try {ssDataServer.close();} catch (IOException ioe) {}
-		if (dcData != null) dcData.close();
-		ssDataClient = null;
-
-		try {
-		    skDataClient = new Socket(skControlClient.getInetAddress(), iClientPort);
-		} catch (IOException e) {
-		    sFromServer = "500 PORT command failed - try using PASV instead.";
-		    osClient.print(sFromServer + CRLF);
-		    osClient.flush();
-		    if (debug) pwDebug.println(sProxy + sFromServer);
-    
-		    System.err.println(e);
-		    return;
-		}
-
-		ssDataServer = new ServerSocket(0);
-
-		int iPort = ssDataServer.getLocalPort();
-		sFromClient = "PORT " + sLocalServerIP + ',' + (int)(iPort/256) + ',' + (iPort % 256);
-
-		osServer.print(sFromClient + CRLF);
-		osServer.flush();
-		if (debug) pwDebug.println(sProxy + sFromClient);
-
-		(dcData = new DataConnect(skDataClient, ssDataServer)).start();
-		 
-	    } else {
-		osServer.print(sFromClient + CRLF);
-		osServer.flush();
-		if (debug) pwDebug.println(sClient + sFromClient);
-	    }
-	}
-    
-	public void start() { 
-	    super.start();
-	    String sFromServer;
-	    while (!bClosed)
-		try {
-		    fromServer();
-		} catch (IOException ioe) {
-		    break;
-		}
-	    close();
-	}
-
-	public void run() {
-	    String sFromClient;
-	    while (!bClosed)
-		try {
-		    if ((sFromClient = readLine(rClient)) == null) {
-			break;
-		    }
-		    fromClient(sFromClient);
-		} catch (IOException ioe) {
-		    break;
-		}
-	    close();
-	}
-    
-	public void close() {
-	    if (!bClosed) {
-		bClosed = true;
-		if (ssDataClient != null) try {ssDataClient.close();} catch (IOException ioe) {}
-		if (ssDataServer != null) try {ssDataServer.close();} catch (IOException ioe) {}
-		if (osClient != null) osClient.close();
-		if (osServer != null) osServer.close();
-		if (dcData != null) dcData.close();
-	    }
-	}
+        } finally {
+            if (ssDataClient != null && !config.clientOneBindPort) {
+                try {ssDataClient.close();} catch (IOException ioe) {}
+            }
+            if (ssDataServer != null && !config.serverOneBindPort) {
+                try {ssDataServer.close();} catch (IOException ioe) {}
+            }
+            if (skDataClient != null) try {skDataClient.close();} catch (IOException ioe) {}
+            if (skDataServer != null) try {skDataServer.close();} catch (IOException ioe) {}
+            if (psClient != null) psClient.close();
+            if (osServer != null) osServer.close();
+            if (dcData != null) dcData.close();
+        }
     }
+
+    private void readCommandFromClient(String fromClient) throws IOException {
+        String cmd = fromClient.toUpperCase();
+        
+        if (cmd.startsWith("PASV")) {
+            if (config.debug) pwDebug.println(client2proxy + fromClient);
+
+            if (ssDataClient != null && !config.clientOneBindPort) {
+                try { ssDataClient.close(); } catch (IOException ioe) {}
+            }
+            if (skDataClient != null) try { skDataClient.close(); } catch (IOException ioe) {}
+            if (dcData != null) dcData.close();
+
+            if (ssDataClient == null || !config.clientOneBindPort) {
+                ssDataClient = getServerSocket(config.clientBindPorts, skControlClient.getLocalAddress());
+            }
+
+            if (ssDataClient != null) {
+                int port = ssDataClient.getLocalPort();
+                String toClient = "227 Entering Passive Mode (" + sLocalClientIP + "," + 
+                        (int) (port / 256) + "," + (port % 256) + ")";
+                psClient.print(toClient + CRLF);
+                psClient.flush();
+                if (config.debug) pwDebug.println(proxy2client + toClient);
+                    
+                setupServerConnection(ssDataClient);
+
+            } else {
+                String toClient = "425 Cannot allocate local port.."; 
+                psClient.print(toClient + CRLF);
+                psClient.flush();
+                if (config.debug) pwDebug.println(proxy2client + toClient);
+            }
+
+        } else if (cmd.startsWith("PORT")) {
+            int port = parsePort(fromClient);
+
+            if (ssDataClient != null && !config.clientOneBindPort) {
+                try {ssDataClient.close();} catch (IOException ioe) {}
+                ssDataClient = null;
+            }
+            if (skDataClient != null) try {skDataClient.close();} catch (IOException ioe) {}
+            if (dcData != null) dcData.close();
+            
+
+            if (config.debug) pwDebug.println(client2proxy + fromClient);
+
+            try {
+                skDataClient = new Socket(skControlClient.getInetAddress(), port);
+
+                String toClient = "200 PORT command successful.";
+                psClient.print(toClient + CRLF);
+                psClient.flush();
+                if (config.debug) pwDebug.println(proxy2client + toClient);
+
+                setupServerConnection(skDataClient);
+
+            } catch (IOException e) {
+                String toClient = "425 PORT command failed - try using PASV instead.";
+                psClient.print(toClient + CRLF);
+                psClient.flush();
+                if (config.debug) pwDebug.println(proxy2client + toClient);
+
+                return;
+            }
+
+             
+        } else {
+            osServer.print(fromClient + CRLF);
+            osServer.flush();
+            if (config.debug) {
+                pwDebug.print(client2server);
+                if (cmd.startsWith("PASS")) {
+                    pwDebug.println("PASS *******");
+                } else {
+                    pwDebug.println(fromClient);
+                }
+            }
+
+            readResponseFromServer(true);
+        }
+    }
+
+    private String readResponseFromServer(boolean forwardToClient) throws IOException {
+        String fromServer = brServer.readLine();
+        String firstLine = fromServer;
+
+        int response = Integer.parseInt(fromServer.substring(0, 3));
+        if (fromServer.charAt(3) == '-') {
+            String multiLine = fromServer.substring(0, 3) + ' ';
+            while (!fromServer.startsWith(multiLine)) {
+                if (forwardToClient) {
+                    psClient.print(fromServer + CRLF);
+                    psClient.flush();
+                }
+                if (config.debug) pwDebug.println((forwardToClient ? server2client : server2proxy) + fromServer);
+
+                fromServer = brServer.readLine();
+            }
+        } 
+        if (forwardToClient || response == 110) {
+            psClient.print(fromServer + CRLF);
+            psClient.flush();
+        }
+        if (config.debug) pwDebug.println((forwardToClient ? server2client : server2proxy) + fromServer);
+        
+        if (response >= 100 && response <= 199) {
+            firstLine = readResponseFromServer(true);
+        }
+
+        return firstLine;
+    }
+
+    private void setupServerConnection(Object s) throws IOException {
+		if (skDataServer != null) {
+		    try {skDataServer.close();} catch (IOException ioe) {}
+		}
+
+        if (serverPassive) {
+            String toServer = "PASV";
+            osServer.print(toServer + CRLF);
+            osServer.flush();
+            if (config.debug) pwDebug.println(proxy2server + toServer);
+
+            String fromServer = readResponseFromServer(false);
+    
+            int port = parsePort(fromServer.substring(0, fromServer.length() - 2));
+
+            skDataServer = new Socket(skControlServer.getInetAddress(), port);
+            
+            (dcData = new DataConnect(s, skDataServer)).start();
+        } else {
+    		if (ssDataServer != null && !config.serverOneBindPort) {
+    		    try {ssDataServer.close();} catch (IOException ioe) {}
+    		}
+    
+            if (ssDataServer == null || !config.serverOneBindPort) {
+                ssDataServer = getServerSocket(config.serverBindPorts, skControlServer.getLocalAddress());
+            }
+    
+            if (ssDataServer != null) {
+                int port = ssDataServer.getLocalPort();
+                String toServer = "PORT " + sLocalServerIP + ',' + (int) (port / 256) + ',' + (port % 256);
+        
+                osServer.print(toServer + CRLF);
+                osServer.flush();
+                if (config.debug) pwDebug.println(proxy2server + toServer);
+        
+                readResponseFromServer(false);
+    
+                (dcData = new DataConnect(s, ssDataServer)).start();
+                
+            } else {
+                String toClient = "425 Cannot allocate local port."; 
+                psClient.print(toClient + CRLF);
+                psClient.flush();
+                if (config.debug) pwDebug.println(proxy2client + toClient);
+            }
+        }
+    }
+
+    public static boolean isInSubnetList(List list, InetAddress ia) {
+        if (list == null) return false;
+        
+        for (Iterator iterator = list.iterator(); iterator.hasNext(); ) {
+            Subnet subnet = (Subnet) iterator.next();
+            
+            if (subnet.isInSubnet(ia)) return true;
+        }
+        return false;
+    }
+    
+    public static int parsePort(String s) throws IOException {
+        int port;
+        try {
+            int i = s.lastIndexOf(',');
+            int j = s.lastIndexOf(',', i - 1);
+            port = Integer.parseInt(s.substring(i + 1));
+            port += 256 * Integer.parseInt(s.substring(j + 1, i));
+        } catch (Exception e) {
+            throw new IOException();
+        }
+        return port;
+    }
+
+    public static synchronized ServerSocket getServerSocket(int[] portRanges, InetAddress ia) throws IOException {
+        ServerSocket ss = null;
+        if (portRanges != null) {
+            int i; //current index of portRanges array
+            int port;
+
+            Integer lastPort = (Integer) lastPorts.get(portRanges);
+            if (lastPort != null) {
+                port = lastPort.intValue();
+                for (i = 0; i < portRanges.length && port > portRanges[i + 1]; i += 2);
+                port++;
+            } else {
+                port = portRanges[0];
+                i = 0;
+            }
+            
+            for (int lastTry = -2; port != lastTry; port++) {
+                if (port > portRanges[i + 1]) {
+                    i = (i + 2) % portRanges.length;
+                    port = portRanges[i];
+                }
+                if (lastTry == -1) lastTry = port;
+                try {
+                    ss = new ServerSocket(port, 1, ia);
+                    lastPorts.put(portRanges, new Integer(port));
+                    break;
+                } catch(BindException e) {
+                    //port already in use
+                }
+            }
+        } else {
+            ss = new ServerSocket(0, 1, ia);
+        }
+        return ss;
+    }
+
+
 
     public class DataConnect extends Thread {
-	private byte bRead[] = new byte[DATABUFFERSIZE];
-	private ServerSocket ss1, ss2;
-	private Socket sk1, sk2;
-	private boolean bClosed, bUsed, bFirst = true;
+        private byte buffer[] = new byte[DATABUFFERSIZE];
+        private final Socket[] sockets = new Socket[2];
+        private boolean isInitialized;
+        private final Object[] o;
 
-	public DataConnect (ServerSocket ss1, ServerSocket ss2) throws SocketException {
-	    this.ss1 = ss1;
-	    this.ss2 = ss2;
-	}
+        //each argument may be either a Socket or a ServerSocket
+        public DataConnect (Object o1, Object o2) {
+            this.o = new Object[] {o1, o2};
+        }
 
-	public DataConnect (Socket sk1, ServerSocket ss2) throws SocketException {
-	    this.sk1 = sk1;
-	    this.ss2 = ss2;
-	}
+        public void run() {
+            BufferedInputStream bis = null;
+            BufferedOutputStream bos = null;
+            try {
+                int n = isInitialized ? 1 : 0;
+                if (!isInitialized) {
+                    for (int i = 0; i < 2; i++) {
+                        if (o[i] instanceof ServerSocket) {
+                            ServerSocket ss = (ServerSocket) o[i];
+                            sockets[i] = ss.accept();
+                            if (ss == ssDataServer && !config.serverOneBindPort ||
+                                ss == ssDataClient && !config.clientOneBindPort) {
 
-	public void run() {
-	    BufferedInputStream bis = null;
-	    BufferedOutputStream bos = null;
-	    try {
-		if (bFirst) {
-		    bFirst = false;
-		    if (ss1 != null) {
-			sk1 = ss1.accept();
-			ss1.close();
-		    }
-		    sk2 = ss2.accept();
-		    ss2.close();
+                                ss.close();
+                            }
+                        } else {
+                            sockets[i] = (Socket) o[i];
+                        }
+                    }
 
-		    sk1.setSoTimeout(DATASOTIMEOUT);
-		    sk2.setSoTimeout(DATASOTIMEOUT);
+                    isInitialized = true;
+                    new Thread(this).start();
+                }
 
-		    bis = new BufferedInputStream(sk1.getInputStream());
-		    bos = new BufferedOutputStream(sk2.getOutputStream());
+                bis = new BufferedInputStream(sockets[n].getInputStream());
+                bos = new BufferedOutputStream(sockets[1 - n].getOutputStream());
 
-		    new Thread(this).start();
-		} else {
-		    bis = new BufferedInputStream(sk2.getInputStream());
-		    bos = new BufferedOutputStream(sk1.getOutputStream());
-		}
-
-		int i;
-		boolean bUsedLocal = false ;
-
-		while (!bClosed) 
-		    try {
-			while ((i = bis.read(bRead, 0, DATABUFFERSIZE)) != -1) {
-			    bos.write(bRead, 0, i);
-			    bUsedLocal = true;
-			    bUsed = true;
-			}
-			break;
-		    } catch (InterruptedIOException iioe) {
-			if (bUsed && !bUsedLocal) return; //use data connection for EITHER send or receive
-		    }
-
-		bos.flush();
-	    } catch (SocketException e) {
-	    	//socket is closed
-	    } catch (IOException e) {
-		System.err.println(e);
-	    }
-	    try {bis.close();} catch (Exception e) {}
-	    try {bos.close();} catch (Exception e) {}
-	    close();
-	}
+                for (;;) {
+                    for (int i; (i = bis.read(buffer, 0, DATABUFFERSIZE)) != -1; ) {
+                        bos.write(buffer, 0, i);
+                    }
+                    break;
+                }
+                bos.flush();
+            } catch (SocketException e) {
+                //socket closed
+            } catch (IOException e) {
+                if (config.debug) e.printStackTrace(pwDebug);
+            }
+            close();
+        }
     
-	public void close() {
-	    if (!bClosed) {
-		bClosed = true;
-		try {sk1.close();} catch (Exception e) {}
-		try {sk2.close();} catch (Exception e) {}
-	    }
-	}
+        public void close() {
+            try { sockets[0].close(); } catch (Exception e) {}
+            try { sockets[1].close(); } catch (Exception e) {}
+        }
     }
 }
+
+class Configuration {
+    int bindPort;
+    InetAddress bindAddress;
+
+    //variables read from configuration file
+    boolean onlyAuto;
+    String autoHostname;
+    int autoPort;
+    boolean isUrlSyntaxEnabled;
+    int[] serverBindPorts;
+    int[] clientBindPorts;
+    boolean serverOneBindPort, clientOneBindPort;
+    
+    boolean debug;
+    
+    //lists of subnets
+    List useActive, usePassive;
+    List allowFrom, denyFrom, allowTo, denyTo;
+    
+    //messages
+    String msgConnect;
+    String msgConnectionRefused;
+    String msgOriginAccessDenied;
+    String msgDestinationAccessDenied;
+    String msgIncorrectSyntax;
+    String msgInternalError;
+
+    public Configuration(Properties properties) throws UnknownHostException {
+
+        bindPort = Integer.parseInt(properties.getProperty("bind_port", "8089").trim());
+        String ba = properties.getProperty("bind_address");
+        bindAddress = ba == null ? null : InetAddress.getByName(ba.trim());
+        
+        serverBindPorts = readPortRanges(properties.getProperty("server_bind_ports"));
+        clientBindPorts = readPortRanges(properties.getProperty("client_bind_ports"));
+        serverOneBindPort = serverBindPorts != null && serverBindPorts.length == 2 &&
+                            serverBindPorts[0] == serverBindPorts[1];
+        clientOneBindPort = clientBindPorts != null && clientBindPorts.length == 2 && 
+                            clientBindPorts[0] == clientBindPorts[1];
+        
+        useActive  = readSubnets(properties.getProperty("use_active"));
+        usePassive = readSubnets(properties.getProperty("use_passive"));
+        allowFrom  = readSubnets(properties.getProperty("allow_from"));
+        denyFrom   = readSubnets(properties.getProperty("deny_from"));
+        allowTo    = readSubnets(properties.getProperty("allow_to"));
+        denyTo     = readSubnets(properties.getProperty("deny_to"));
+        onlyAuto   = properties.getProperty("only_auto", "0").trim().equals("1");
+        autoHostname = properties.getProperty("auto_host");
+        if (autoHostname != null) autoHostname = autoHostname.trim();
+        autoPort = Integer.parseInt(properties.getProperty("auto_port", "21").trim());
+        isUrlSyntaxEnabled = properties.getProperty("enable_url_syntax", "1").trim().equals("1");
+
+        debug = properties.getProperty("output_debug_info", "0").trim().equals("1");
+
+
+        msgConnect = "220 " + 
+            properties.getProperty("msg_connect", 
+                                   "Java FTP Proxy Server (usage: USERID=user@site) ready.");        
+        msgConnectionRefused = "421 " + 
+            properties.getProperty("msg_connection_refused", 
+                                   "Connection refused, closing connection.");    
+        msgOriginAccessDenied = "531 " + 
+            properties.getProperty("msg_origin_access_denied", 
+                                   "Access denied - closing connection.");                                       
+        msgDestinationAccessDenied = "531 " + 
+            properties.getProperty("msg_destination_access_denied", 
+                                   "Access denied - closing connection."); 
+        msgIncorrectSyntax = "531 " + 
+            properties.getProperty("msg_incorrect_syntax", 
+                                   "Incorrect usage - closing connection.");
+        msgInternalError = "421 " + 
+            properties.getProperty("msg_internal_error", 
+                                   "Internal error, closing connection.");
+    }
+
+    public static List readSubnets(String s) {
+        if (s == null) return null;
+        
+        List list = new LinkedList();
+        StringTokenizer st = new StringTokenizer(s.trim(), ",");
+        while (st.hasMoreTokens()) {
+            list.add(new Subnet(st.nextToken().trim()));
+        }
+        
+        return list;
+    }
+
+    /**
+     * Returns an array of length 2n, where n is the number of port
+     * ranges specified. Index 2i will contain the first port number
+     * in the i'th range, and index 2i+1 will contain the last.
+     * E.g. the string "111,222-333,444-555,666" will result in the 
+     * following array: {111, 111, 222, 333, 444, 555, 666, 666}
+     */    
+    public static int[] readPortRanges(String s) {
+        if (s == null) return null;
+
+        StringTokenizer st = new StringTokenizer(s.trim(), ",");
+        int[] ports = new int[st.countTokens() * 2];
+        
+        if (ports.length == 0) return null;
+        
+        int lastPort = 0;
+        for (int p = 0; st.hasMoreTokens(); p += 2) {
+            String range = st.nextToken().trim();
+            int i = range.indexOf('-');
+
+            if (i == -1) {
+                ports[p] = ports[p + 1] = Integer.parseInt(range);
+            } else {
+                ports[p] = Integer.parseInt(range.substring(0, i));
+                ports[p + 1] = Integer.parseInt(range.substring(i + 1));
+            }
+            if (ports[p] < lastPort || ports[p] > ports[p + 1]) {
+                throw new RuntimeException("Ports should be listed in increasing order.");
+            }
+            lastPort = ports[p + 1];
+        }
+        
+        return ports;
+    }
+}            
 
