@@ -1,5 +1,5 @@
 /*
-Java FTP Proxy Server 1.2.3
+Java FTP Proxy Server 1.2.4
 Copyright (C) 1998-2002 Christian Schmidt
 
 This program is free software; you can redistribute it and/or
@@ -425,7 +425,7 @@ public class FtpProxy extends Thread {
 
             String fromServer = readResponseFromServer(false);
     
-            int port = parsePort(fromServer.substring(0, fromServer.length() - 2));
+            int port = parsePort(fromServer);
 
             skDataServer = new Socket(skControlServer.getInetAddress(), port);
             
@@ -474,10 +474,15 @@ public class FtpProxy extends Thread {
     public static int parsePort(String s) throws IOException {
         int port;
         try {
-            int i = s.lastIndexOf(',');
-            int j = s.lastIndexOf(',', i - 1);
-            port = Integer.parseInt(s.substring(i + 1));
-            port += 256 * Integer.parseInt(s.substring(j + 1, i));
+            // (aa,bb,cc,dd,XXX,YYY).
+            //             ^   ^   ^
+            //            p1  p2  p3
+            int p2 = s.lastIndexOf(',');
+            int p3;
+            for (p3 = p2 + 1; p3 < s.length() && Character.isDigit(s.charAt(p3)); p3++);
+            int p1 = s.lastIndexOf(',', p2 - 1);
+            port = Integer.parseInt(s.substring(p2 + 1, p3));
+            port += 256 * Integer.parseInt(s.substring(p1 + 1, p2));
         } catch (Exception e) {
             throw new IOException();
         }
