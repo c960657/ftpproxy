@@ -212,14 +212,15 @@ public class FtpProxy extends Thread {
 
                 String userString = fromClient.substring(5);
 
-                int a = userString.indexOf('@');
+                int a = userString.lastIndexOf('@');
                 int c = userString.lastIndexOf(':');
+                if (c < a) c = -1;
 
-                if (a == -1 && config.isUrlSyntaxEnabled) {
-                    int a1 = userString.indexOf('*');
-                    if (a1 != -1) {
-                        a = a1;
-                        c = userString.lastIndexOf('*');
+                if (a == -1 && args.length > 1) {
+                    int c1 = userString.lastIndexOf('*');
+                    if (c1 != -1) {
+                        c = c1;
+                        a = userString.lastIndexOf('*', c - 1);
                         if (c == a) c = -1;
                     }
                 }
