@@ -341,7 +341,7 @@ public class FtpProxy extends Thread {
             return;
         }
 
-        if (cmd.startsWith("PASV")) {
+        if (cmd.startsWith("PASV") || cmd.startsWith("EPSV")) {
             if (config.debug) pwDebug.println(client2proxy + fromClient);
 
             if (ssDataClient != null && !config.clientOneBindPort) {
@@ -357,8 +357,13 @@ public class FtpProxy extends Thread {
             if (ssDataClient != null) {
                 int port = ssDataClient.getLocalPort();
 
-                String toClient = "227 Entering Passive Mode (" + sLocalClientIP + "," +
+                String toClient;
+                if (cmd.startsWith("EPSV")) {
+                  toClient = "229 Entering Extended Passive Mode (|||" + port + "|)";
+                } else {
+                  toClient = "227 Entering Passive Mode (" + sLocalClientIP + "," +
                         (int) (port / 256) + "," + (port % 256) + ")";
+                }
                 psClient.print(toClient + CRLF);
                 psClient.flush();
                 if (config.debug) pwDebug.println(proxy2client + toClient);
