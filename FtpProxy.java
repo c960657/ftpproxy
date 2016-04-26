@@ -216,7 +216,7 @@ public class FtpProxy extends Thread {
                 int c = userString.lastIndexOf(':');
                 if (c < a) c = -1;
 
-                if (a == -1 && args.length > 1) {
+                if (a == -1 && config.isUrlSyntaxEnabled) {
                     int c1 = userString.lastIndexOf('*');
                     if (c1 != -1) {
                         c = c1;
